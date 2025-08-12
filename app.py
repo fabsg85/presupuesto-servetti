@@ -7,14 +7,15 @@ from datetime import datetime
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import plotly.express as px
 import plotly.graph_objects as go
+import math
 
-st.set_page_config(page_title="Presupuesto Familiar — Plus", layout="wide")
+st.set_page_config(page_title="Presupuesto Familiar — Pro", layout="wide")
 
-st.title("📊 Presupuesto Familiar — Dashboard avanzado")
-st.caption("Versión con editor tipo Excel, KPIs ampliados, gráficas mejoradas, forecast por serie y alertas.")
+st.title("📊 Presupuesto Familiar — Pro")
+st.caption("Incluye editor tipo Excel, análisis de ingresos, simulación de escenarios, proyección de ahorro, multi-cuenta/moneda (UYU y USD) y tags.")
 
 # -----------------------------
-# Parsing helpers
+# Helpers
 # -----------------------------
 MONTHS = ['ENE','FEB','MAR','ABR','MAY','JUN','JUL','AGO','SEP','OCT','NOV','DIC']
 MONTHS_MAP = {m:i+1 for i,m in enumerate(MONTHS)}
@@ -116,7 +117,8 @@ def tidy_from_parsed(parsed):
                         val = r.get(m, np.nan)
                         if pd.notna(val):
                             cat_exp_rows.append({
-                                "year": int(year), "month": mon_num, "category": r["name"], "amount": float(val)
+                                "year": int(year), "month": mon_num, "category": r["name"], "amount": float(val),
+                                "account": "Excel", "currency": "UYU", "tags": ""
                             })
         inc_cat = content.get("income_categories", pd.DataFrame())
         if not inc_cat.empty:
@@ -126,7 +128,8 @@ def tidy_from_parsed(parsed):
                         val = r.get(m, np.nan)
                         if pd.notna(val):
                             cat_inc_rows.append({
-                                "year": int(year), "month": mon_num, "category": r["name"], "amount": float(val)
+                                "year": int(year), "month": mon_num, "category": r["name"], "amount": float(val),
+                                "account": "Excel", "currency": "UYU", "tags": ""
                             })
     totals_df = pd.DataFrame(rows).dropna()
     by_exp_cat = pd.DataFrame(cat_exp_rows)
@@ -146,7 +149,6 @@ def load_workbook(file_bytes=None):
     return sheets, totals_df, exp_by_cat, inc_by_cat
 
 def forecast_series(series, periods=6, seasonal=None):
-    # Requires >= 6 data points. If multi-year (>=12), enable seasonality=12
     s = series.astype(float).dropna()
     if len(s) < 6:
         return None
@@ -158,75 +160,84 @@ def forecast_series(series, periods=6, seasonal=None):
     except Exception:
         return None
 
+def compound_growth(monthly_contrib, annual_rate, months):
+    if annual_rate is None or annual_rate == 0:
+        return monthly_contrib * months
+    r = annual_rate / 12.0 / 100.0
+    # Future value of annuity due (payments at period end assumed here)
+    fv = monthly_contrib * (((1 + r)**months - 1) / r)
+    return fv
+
 # -----------------------------
-# UI: Sidebar
+# Sidebar: inputs globales
 # -----------------------------
 with st.sidebar:
     st.header("📥 Datos de entrada")
-    uploaded = st.file_uploader("Subí el Excel con el formato actual (2023/2024/2025)", type=["xls","xlsx"])
+    uploaded = st.file_uploader("Subí el Excel (2023/2024/2025)", type=["xls","xlsx"])
+
+    st.markdown("---")
+    st.subheader("💱 Moneda y cuentas")
+    base_currency = st.selectbox("Moneda base", ["UYU","USD"], index=0)
+    fx = st.number_input("Tipo de cambio (USD → UYU)", min_value=1.0, value=40.0, step=0.5)
+    st.caption("Los datos del Excel se asumen en UYU. Las transacciones manuales permiten UYU o USD.")
 
     st.markdown("---")
     st.subheader("🎯 Objetivos & Alertas")
-    target_savings = st.number_input("Objetivo de ahorro mensual (aprox.)", min_value=0.0, value=0.0, step=100.0)
+    target_savings = st.number_input("Objetivo de ahorro mensual (en moneda base)", min_value=0.0, value=0.0, step=100.0)
     alert_threshold = st.slider("Alerta cuando el gasto mensual exceda su media 3m por (%)", 5, 100, 25)
     compare_prev_year = st.toggle("Comparar contra mismo mes del año anterior", True)
 
     st.markdown("---")
-    st.subheader("💾 Exportar")
-    st.caption("Podés descargar CSVs con los datos procesados o el editor por año.")
+    st.subheader("🧪 Simulación (What-if)")
+    sim_inc = st.slider("Ajuste ingresos (% mensual)", -50, 50, 0)
+    sim_exp = st.slider("Ajuste gastos (% mensual)", -50, 50, 0)
+    st.caption("Aplica un delta uniforme sobre el año seleccionado para estimar impacto.")
 
 # -----------------------------
-# Load & session state
+# Load workbook
 # -----------------------------
-if "edited_tables" not in st.session_state:
-    st.session_state["edited_tables"] = {}  # per year: {"income": df, "expense": df}
+if "transactions" not in st.session_state:
+    st.session_state["transactions"] = pd.DataFrame(columns=[
+        "date","type","category","amount","account","currency","tags","notes"
+    ])
 
 sheets, totals_df, exp_by_cat, inc_by_cat = (None, None, None, None)
 if uploaded is not None:
     sheets, totals_df, exp_by_cat, inc_by_cat = load_workbook(uploaded.read())
 
 if totals_df is None or totals_df.empty:
-    st.info("👋 Cargá tu Excel para ver KPIs y usar el editor tipo Excel.")
+    st.info("👋 Cargá tu Excel para continuar.")
     st.stop()
 
 # -----------------------------
-# Editor tipo Excel (por año)
+# Editor tipo Excel
 # -----------------------------
 years = sorted({int(y) for y in totals_df["year"].unique()})
 st.subheader("🧾 Editor tipo Excel — por año")
 year_tab = st.selectbox("Año a editar", years, index=len(years)-1)
 
-# Get initial tables for the selected year
-def get_year_tables(year):
-    # Build wide income/expense tables from category details if available; if not, from totals only
-    inc = inc_by_cat[inc_by_cat["year"]==year] if inc_by_cat is not None else pd.DataFrame()
-    exp = exp_by_cat[exp_by_cat["year"]==year] if exp_by_cat is not None else pd.DataFrame()
+def get_wide(df, year):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["name"] + MONTHS)
+    dfy = df[df["year"]==year]
+    wide = dfy.pivot_table(index="category", columns="month", values="amount", aggfunc="sum").fillna(0)
+    if wide.empty:
+        return pd.DataFrame(columns=["name"] + MONTHS)
+    wide.columns = [REV_MONTHS_MAP.get(c, c) for c in wide.columns]
+    wide = wide.reset_index().rename(columns={"category":"name"})
+    for m in MONTHS:
+        if m not in wide.columns:
+            wide[m] = 0.0
+    return wide[["name"] + MONTHS]
 
-    def to_wide(df, label):
-        if df is None or df.empty:
-            return pd.DataFrame(columns=["name"] + MONTHS)
-        wide = df.pivot_table(index="category", columns="month", values="amount", aggfunc="sum").fillna(0)
-        wide.columns = [REV_MONTHS_MAP.get(c, c) for c in wide.columns]
-        wide = wide.reset_index().rename(columns={"category":"name"})
-        # Ensure all months present
-        for m in MONTHS:
-            if m not in wide.columns:
-                wide[m] = 0.0
-        return wide[["name"] + MONTHS]
-
-    inc_w = to_wide(inc, "Ingreso")
-    exp_w = to_wide(exp, "Gasto")
-    return inc_w, exp_w
-
-if year_tab not in st.session_state["edited_tables"]:
-    inc_w, exp_w = get_year_tables(year_tab)
-    st.session_state["edited_tables"][year_tab] = {"income": inc_w, "expense": exp_w}
+inc_wide = get_wide(inc_by_cat, year_tab)
+exp_wide = get_wide(exp_by_cat, year_tab)
 
 col1, col2 = st.columns(2, gap="large")
 with col1:
     st.markdown("**Ingresos (editor)**")
     inc_edit = st.data_editor(
-        st.session_state["edited_tables"][year_tab]["income"],
+        inc_wide,
         num_rows="dynamic",
         use_container_width=True,
         column_config={m: st.column_config.NumberColumn(m, format="%.2f", step=1) for m in MONTHS} | {
@@ -237,7 +248,7 @@ with col1:
 with col2:
     st.markdown("**Gastos (editor)**")
     exp_edit = st.data_editor(
-        st.session_state["edited_tables"][year_tab]["expense"],
+        exp_wide,
         num_rows="dynamic",
         use_container_width=True,
         column_config={m: st.column_config.NumberColumn(m, format="%.2f", step=1) for m in MONTHS} | {
@@ -246,195 +257,267 @@ with col2:
         key=f"exp_editor_{year_tab}"
     )
 
-# Save back to session
-st.session_state["edited_tables"][year_tab]["income"]  = inc_edit
-st.session_state["edited_tables"][year_tab]["expense"] = exp_edit
+def wide_to_tidy(wide, year, kind):
+    rows = []
+    for _, r in wide.iterrows():
+        for m in MONTHS:
+            v = r.get(m, 0.0)
+            if pd.notna(v) and float(v) != 0.0:
+                rows.append({
+                    "year": int(year), "month": MONTHS_MAP[m],
+                    "category": r["name"], "amount": float(v),
+                    "account": "Excel-Editado", "currency": "UYU", "tags": ""
+                })
+    return pd.DataFrame(rows)
 
-# Rebuild aggregates from editors (override parsed for this year)
-def rebuild_totals_from_editors(totals_df, inc_by_cat, exp_by_cat):
-    # Copy
-    tdf = totals_df.copy()
-    ibc = inc_by_cat.copy() if inc_by_cat is not None else pd.DataFrame(columns=["year","month","category","amount"])
-    ebc = exp_by_cat.copy() if exp_by_cat is not None else pd.DataFrame(columns=["year","month","category","amount"])
+inc_tidy = wide_to_tidy(inc_edit, year_tab, "income")
+exp_tidy = wide_to_tidy(exp_edit, year_tab, "expense")
 
-    for y, data in st.session_state["edited_tables"].items():
-        # Turn wide into tidy
-        for kind in ["income","expense"]:
-            wide = data[kind]
-            tidy_rows = []
-            for _, r in wide.iterrows():
-                for m in MONTHS:
-                    val = r.get(m, 0.0)
-                    if pd.notna(val) and float(val) != 0.0:
-                        tidy_rows.append({"year": int(y), "month": MONTHS_MAP[m], "category": r["name"], "amount": float(val)})
-            tidy = pd.DataFrame(tidy_rows)
-            if kind == "income":
-                ibc = ibc[ibc["year"]!=int(y)]
-                ibc = pd.concat([ibc, tidy], ignore_index=True)
+# Reemplazar datos del año por los editados
+inc_by_cat2 = inc_by_cat[inc_by_cat["year"]!=year_tab].copy() if inc_by_cat is not None else pd.DataFrame()
+exp_by_cat2 = exp_by_cat[exp_by_cat["year"]!=year_tab].copy() if exp_by_cat is not None else pd.DataFrame()
+inc_by_cat2 = pd.concat([inc_by_cat2, inc_tidy], ignore_index=True)
+exp_by_cat2 = pd.concat([exp_by_cat2, exp_tidy], ignore_index=True)
+
+# -----------------------------
+# Transacciones manuales (multi-cuenta/moneda + tags)
+# -----------------------------
+st.subheader("🧾 Transacciones manuales (multi-cuenta / UYU-USD / tags)")
+tx = st.session_state["transactions"]
+tx_edit = st.data_editor(
+    tx,
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config={
+        "date": st.column_config.DateColumn("Fecha"),
+        "type": st.column_config.SelectboxColumn("Tipo", options=["Ingreso","Gasto"]),
+        "category": st.column_config.TextColumn("Categoría"),
+        "amount": st.column_config.NumberColumn("Monto", step=1, format="%.2f"),
+        "account": st.column_config.TextColumn("Cuenta"),
+        "currency": st.column_config.SelectboxColumn("Moneda", options=["UYU","USD"]),
+        "tags": st.column_config.TextColumn("Tags (coma-separados)"),
+        "notes": st.column_config.TextColumn("Notas"),
+    },
+    key="tx_editor"
+)
+st.session_state["transactions"] = tx_edit
+
+# Filtros avanzados
+st.markdown("#### 🔎 Filtros")
+colf1, colf2, colf3 = st.columns(3)
+with colf1:
+    account_filter = st.text_input("Cuenta (contiene)", "")
+with colf2:
+    tag_filter = st.text_input("Tags (contiene)", "")
+with colf3:
+    show_currency = st.selectbox("Ver montos en", [base_currency, ("USD" if base_currency=="UYU" else "UYU")], index=0)
+
+def convert_amount(row_amount, row_cur, to_cur, fx):
+    if row_cur == to_cur:
+        return row_amount
+    # USD <-> UYU only
+    if row_cur == "USD" and to_cur == "UYU":
+        return row_amount * fx
+    if row_cur == "UYU" and to_cur == "USD":
+        return row_amount / fx
+    return row_amount
+
+# Tidy total a partir de categorias + transacciones
+def build_totals(inc_by_cat, exp_by_cat, tx_df):
+    # Manual tx tidy (monthly)
+    manual = pd.DataFrame()
+    if tx_df is not None and not tx_df.empty:
+        t = tx_df.dropna(subset=["date","amount"]).copy()
+        t["date"] = pd.to_datetime(t["date"], errors="coerce")
+        t = t.dropna(subset=["date"])
+        if account_filter:
+            t = t[t["account"].fillna("").str.contains(account_filter, case=False, na=False)]
+        if tag_filter:
+            t = t[t["tags"].fillna("").str.contains(tag_filter, case=False, na=False)]
+        t["year"] = t["date"].dt.year
+        t["month"] = t["date"].dt.month
+        sign = np.where(t["type"]=="Ingreso", 1, -1)
+        # Convert amounts to base currency for aggregation
+        t["amount_base"] = [convert_amount(a, c, base_currency, fx) for a,c in zip(t["amount"], t["currency"])]
+        manual = t.groupby(["year","month","type"], as_index=False)["amount_base"].sum()
+
+    # Build from categories (assume UYU → convert if needed for display)
+    inc = inc_by_cat.groupby(["year","month"], as_index=False)["amount"].sum().rename(columns={"amount":"income"})
+    exp = exp_by_cat.groupby(["year","month"], as_index=False)["amount"].sum().rename(columns={"amount":"expense"})
+    merged = pd.merge(inc, exp, on=["year","month"], how="outer").fillna(0)
+
+    # Apply manual adjustments
+    if not manual.empty:
+        for _, r in manual.iterrows():
+            mask = (merged["year"]==r["year"]) & (merged["month"]==r["month"])
+            if not mask.any():
+                merged = pd.concat([merged, pd.DataFrame({"year":[r["year"]], "month":[r["month"]], "income":[0.0], "expense":[0.0]})], ignore_index=True)
+                mask = (merged["year"]==r["year"]) & (merged["month"]==r["month"])
+            if r["type"]=="Ingreso":
+                merged.loc[mask, "income"] = merged.loc[mask, "income"] + r["amount_base"]
             else:
-                ebc = ebc[ebc["year"]!=int(y)]
-                ebc = pd.concat([ebc, tidy], ignore_index=True)
+                merged.loc[mask, "expense"] = merged.loc[mask, "expense"] + r["amount_base"]
 
-    # Rebuild totals from categories
-    inc_tot = ibc.groupby(["year","month"], as_index=False)["amount"].sum().rename(columns={"amount":"income"})
-    exp_tot = ebc.groupby(["year","month"], as_index=False)["amount"].sum().rename(columns={"amount":"expense"})
-    merged = pd.merge(inc_tot, exp_tot, on=["year","month"], how="outer").fillna(0)
-    merged = merged.melt(id_vars=["year","month"], var_name="kind", value_name="amount")
-    # Remove original rows for edited years and add new
-    edited_years = list(st.session_state["edited_tables"].keys())
-    tdf = tdf[~tdf["year"].isin(edited_years)]
-    tdf = pd.concat([tdf, merged], ignore_index=True)
-    return tdf, ebc, ibc
+    # Currency conversion for display
+    if show_currency != "UYU":
+        # convert from base to other display currency
+        if base_currency == "UYU" and show_currency == "USD":
+            merged["income"] = merged["income"] / fx
+            merged["expense"] = merged["expense"] / fx
+        elif base_currency == "USD" and show_currency == "UYU":
+            merged["income"] = merged["income"] * fx
+            merged["expense"] = merged["expense"] * fx
 
-totals_df2, exp_by_cat2, inc_by_cat2 = rebuild_totals_from_editors(totals_df, inc_by_cat, exp_by_cat)
+    merged["net"] = merged["income"] - merged["expense"]
+    return merged
+
+totals_df2 = build_totals(inc_by_cat2, exp_by_cat2, st.session_state["transactions"])
 
 # -----------------------------
-# KPIs ampliados
+# KPIs y análisis (incluye dependencia de ingresos)
 # -----------------------------
-net = (totals_df2.pivot_table(index=["year","month"], columns="kind", values="amount", aggfunc="sum")
-       .reset_index())
-for col in ["income","expense"]:
-    if col not in net.columns: net[col] = 0.0
-net["net"] = net["income"] - net["expense"]
+st.markdown("---")
+st.subheader("📌 KPIs y análisis")
+year_sel = st.selectbox("Año", sorted(totals_df2["year"].unique()), index=len(sorted(totals_df2["year"].unique()))-1)
 
-year_sel = st.selectbox("Año para KPIs y gráficos", years, index=len(years)-1, key="kpi_year")
-df_year = net[net["year"]==year_sel].sort_values("month")
-
-# Moving averages
-df_year["net_ma3"] = df_year["net"].rolling(3).mean()
-df_year["exp_ma3"] = df_year["expense"].rolling(3).mean()
+df_year = totals_df2[totals_df2["year"]==year_sel].sort_values("month").copy()
 df_year["inc_ma3"] = df_year["income"].rolling(3).mean()
+df_year["exp_ma3"] = df_year["expense"].rolling(3).mean()
+df_year["net_ma3"] = df_year["net"].rolling(3).mean()
 
 ytd_income  = df_year["income"].sum()
 ytd_expense = df_year["expense"].sum()
 ytd_net     = df_year["net"].sum()
-avg_net     = df_year["net"].mean()
 savings_rate = (1 - (ytd_expense / ytd_income)) * 100 if ytd_income else np.nan
-best_month = int(df_year.loc[df_year["net"].idxmax(),"month"]) if not df_year.empty else None
-worst_month = int(df_year.loc[df_year["net"].idxmin(),"month"]) if not df_year.empty else None
-volatility = df_year["net"].std()
 
 k1,k2,k3,k4 = st.columns(4)
-k1.metric("Ingresos YTD", f"{ytd_income:,.0f}")
-k2.metric("Gastos YTD", f"{ytd_expense:,.0f}")
-k3.metric("Ahorro Neto YTD", f"{ytd_net:,.0f}")
+k1.metric(f"Ingresos YTD ({show_currency})", f"{ytd_income:,.0f}")
+k2.metric(f"Gastos YTD ({show_currency})", f"{ytd_expense:,.0f}")
+k3.metric(f"Ahorro Neto YTD ({show_currency})", f"{ytd_net:,.0f}")
 k4.metric("Tasa de Ahorro", f"{savings_rate:,.1f}%")
 
-k5,k6,k7,k8 = st.columns(4)
-k5.metric("Prom. neto mensual", f"{avg_net:,.0f}")
-k6.metric("Volatilidad (σ neto)", f"{volatility:,.0f}")
-k7.metric("Mejor mes (neto)", f"{best_month if best_month else '-'}")
-k8.metric("Peor mes (neto)", f"{worst_month if worst_month else '-'}")
+# Dependencia de ingresos (por fuente/categoría)
+st.markdown("#### 📈 Dependencia de ingresos por fuente")
+inc_src = inc_by_cat2[inc_by_cat2["year"]==year_sel].groupby("category", as_index=False)["amount"].sum()
+inc_total_base = inc_src["amount"].sum()
+if inc_total_base > 0:
+    inc_src["share_%"] = (inc_src["amount"] / inc_total_base) * 100
+    pie_inc = px.pie(inc_src.sort_values("share_%", ascending=False), names="category", values="share_%", title="Participación de cada fuente de ingreso (base UYU)")
+    st.plotly_chart(pie_inc, use_container_width=True)
+    top_dep = inc_src.sort_values("share_%", ascending=False).head(3)
+    st.caption("Top dependencia: " + ", ".join([f"{r.category}: {r['share_%']:.1f}%" for _,r in top_dep.iterrows()]))
+else:
+    st.info("No hay datos de ingresos por fuente para este año.")
 
 # -----------------------------
-# Gráficas mejoradas
+# Gráficos principales
 # -----------------------------
-st.markdown("### 📈 Evolución mensual y medias móviles")
-fig_line = px.line(df_year, x="month", y=["income","expense","net","net_ma3"], markers=True,
-                   labels={"value":"Monto","month":"Mes","variable":"Serie"})
-st.plotly_chart(fig_line, use_container_width=True)
+st.markdown("### 📉 Evolución mensual")
+line = px.line(df_year, x="month", y=["income","expense","net","net_ma3"], markers=True,
+               labels={"value":f"Monto ({show_currency})","month":"Mes","variable":"Serie"})
+st.plotly_chart(line, use_container_width=True)
 
-st.markdown("### 📊 Ingresos vs Gastos (stacked)")
-bar = px.bar(df_year.melt(id_vars=["month"], value_vars=["income","expense"], var_name="tipo", value_name="monto"),
-             x="month", y="monto", color="tipo", barmode="group")
-st.plotly_chart(bar, use_container_width=True)
-
-# Heatmap de gasto por categoría
-if not exp_by_cat2.empty:
-    cats_year = exp_by_cat2[exp_by_cat2["year"]==year_sel]
+st.markdown("### 🔥 Heatmap de gastos por categoría")
+cats_year = exp_by_cat2[exp_by_cat2["year"]==year_sel]
+if not cats_year.empty:
+    # Filtros por account/tag sobre categorías via transacciones no aplican; aquí son datos Excel/edición
     heat = cats_year.pivot_table(index="category", columns="month", values="amount", aggfunc="sum").fillna(0)
     heat = heat[sorted(heat.columns)]
-    im = px.imshow(heat, aspect="auto", labels=dict(x="Mes", y="Categoría", color="Gasto"))
-    st.markdown("### 🔥 Heatmap de gastos por categoría")
+    im = px.imshow(heat, aspect="auto", labels=dict(x="Mes", y="Categoría", color="Gasto (UYU)"))
     st.plotly_chart(im, use_container_width=True)
-
-# Treemap top categorías
-if not exp_by_cat2.empty:
-    top_cats = (exp_by_cat2[exp_by_cat2["year"]==year_sel]
-                .groupby("category", as_index=False)["amount"].sum()
-                .sort_values("amount", ascending=False).head(20))
-    tree = px.treemap(top_cats, path=["category"], values="amount", title="Top 20 categorías del año")
-    st.plotly_chart(tree, use_container_width=True)
-
-# Waterfall del neto
-wf = go.Figure(go.Waterfall(
-    x=[REV_MONTHS_MAP[m] for m in df_year["month"]],
-    measure=["relative"]*len(df_year),
-    y=df_year["net"],
-    connector={"line":{"dash":"dot"}},
-))
-wf.update_layout(title="💧 Waterfall — Cash flow neto por mes", showlegend=False)
-st.plotly_chart(wf, use_container_width=True)
-
-# Comparación con año anterior (opcional)
-if compare_prev_year and (year_sel-1 in years):
-    prev = net[net["year"]==year_sel-1].sort_values("month")
-    comp = df_year[["month","income","expense","net"]].merge(prev[["month","income","expense","net"]], on="month", suffixes=("", "_prev"), how="left")
-    comp_fig = px.line(comp, x="month", y=["net","net_prev"], markers=True, title=f"Comparativa neto {year_sel} vs {year_sel-1}")
-    st.plotly_chart(comp_fig, use_container_width=True)
+else:
+    st.info("No hay desglose de categorías para gastos en este año.")
 
 # -----------------------------
-# Forecast por serie e insight
+# Simulación de escenarios (what-if)
 # -----------------------------
-st.markdown("### 🔮 Forecast (6 meses) — ingresos, gastos y neto")
-multi_year = len(net["year"].unique()) >= 2
-ser_inc = df_year.set_index("month")["income"]
-ser_exp = df_year.set_index("month")["expense"]
+st.markdown("---")
+st.subheader("🧪 Simulación de escenarios")
+
+sim_df = df_year.copy()
+sim_df["income_sim"]  = sim_df["income"] * (1 + sim_inc/100.0)
+sim_df["expense_sim"] = sim_df["expense"] * (1 + sim_exp/100.0)
+sim_df["net_sim"]     = sim_df["income_sim"] - sim_df["expense_sim"]
+
+c1,c2,c3 = st.columns(3)
+c1.metric("Δ Ingresos (anual)", f"{(sim_df['income_sim'].sum()-df_year['income'].sum()):,.0f} {show_currency}")
+c2.metric("Δ Gastos (anual)", f"{(sim_df['expense_sim'].sum()-df_year['expense'].sum()):,.0f} {show_currency}")
+c3.metric("Δ Neto (anual)", f"{(sim_df['net_sim'].sum()-df_year['net'].sum()):,.0f} {show_currency}")
+
+sim_fig = px.line(sim_df, x="month", y=["net","net_sim"], markers=True, title="Neto vs Neto simulado")
+st.plotly_chart(sim_fig, use_container_width=True)
+
+# -----------------------------
+# Forecast y proyección de ahorro a largo plazo
+# -----------------------------
+st.markdown("---")
+st.subheader("🔮 Forecast + Proyección de ahorro")
+multi_year = len(totals_df2["year"].unique()) >= 2
 ser_net = df_year.set_index("month")["net"]
+f_net = None
+try:
+    f_net = forecast_series(ser_net, 6, seasonal=multi_year)
+except Exception:
+    f_net = None
 
-f_inc = forecast_series(ser_inc, 6, seasonal=multi_year)
-f_exp = forecast_series(ser_exp, 6, seasonal=multi_year)
-f_net = forecast_series(ser_net, 6, seasonal=multi_year)
+if f_net is not None:
+    fc_df = pd.DataFrame({"month": list(ser_net.index) + list(range(int(ser_net.index.max())+1, int(ser_net.index.max())+1+len(f_net))),
+                          "net": list(ser_net.values) + list(f_net.values),
+                          "tipo": ["hist"]*len(ser_net) + ["forecast"]*len(f_net)})
+    area = px.area(fc_df, x="month", y="net", color="tipo", title=f"Cash flow neto — histórico y forecast (6 meses) [{show_currency}]")
+    st.plotly_chart(area, use_container_width=True)
+    st.caption(f"Proyección 6m: {f_net.sum():,.0f} {show_currency} | Promedio mensual proyectado: {f_net.mean():,.0f} {show_currency}")
+else:
+    st.info("Se necesitan al menos 6 puntos válidos para el forecast de neto.")
 
-def plot_forecast(hist, fcast, title):
-    if fcast is None:
-        st.info(f"No hay suficientes datos para {title}.")
-        return
-    fc_df = pd.DataFrame({
-        "month": list(hist.index) + list(range(int(hist.index.max())+1, int(hist.index.max())+1+len(fcast))),
-        "value": list(hist.values) + list(fcast.values),
-        "tipo": ["hist"]*len(hist) + ["forecast"]*len(fcast)
-    })
-    fig = px.area(fc_df, x="month", y="value", color="tipo", title=title)
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"Proyección 6m total: {fcast.sum():,.0f} | Promedio mensual proyectado: {fcast.mean():,.0f}")
+st.markdown("#### 💡 Proyección de ahorro a 1, 3 y 5 años")
+colp1, colp2 = st.columns(2)
+with colp1:
+    contrib = st.number_input(f"Aporte mensual estimado ({show_currency})", min_value=0.0, value=float(max(0, ser_net.mean() if len(ser_net)>0 else 0)), step=100.0)
+with colp2:
+    rate = st.number_input("Tasa anual estimada (%)", min_value=0.0, value=3.0, step=0.5)
 
-cols = st.columns(3)
-with cols[0]: plot_forecast(ser_inc, f_inc, "Ingresos")
-with cols[1]: plot_forecast(ser_exp, f_exp, "Gastos")
-with cols[2]: plot_forecast(ser_net, f_net, "Neto")
+proj = {
+    "1 año": compound_growth(contrib, rate, 12),
+    "3 años": compound_growth(contrib, rate, 36),
+    "5 años": compound_growth(contrib, rate, 60),
+}
+pcol1,pcol2,pcol3 = st.columns(3)
+pcol1.metric("1 año", f"{proj['1 año']:,.0f} {show_currency}")
+pcol2.metric("3 años", f"{proj['3 años']:,.0f} {show_currency}")
+pcol3.metric("5 años", f"{proj['5 años']:,.0f} {show_currency}")
+
+st.caption("La proyección usa interés compuesto simple mensual con aportes constantes. No incluye impuestos ni variaciones de tasa.")
 
 # -----------------------------
-# Alertas y sugerencias
+# Alertas (reutiliza configuración previa)
 # -----------------------------
-st.markdown("### 🚨 Alertas inteligentes")
+st.markdown("---")
+st.subheader("🚨 Alertas")
 alerts = []
 
-# 1) Gasto mensual vs media móvil 3m por categoría
-if not exp_by_cat2.empty:
-    cy = exp_by_cat2[exp_by_cat2["year"]==year_sel]
-    for m in sorted(cy["month"].unique()):
-        cm = cy[cy["month"]==m]
-        # MA3 por categoría
-        for cat, grp in cy.groupby("category"):
-            series = grp.set_index("month").sort_index()["amount"]
+# Neto vs objetivo
+if target_savings and target_savings > 0 and not df_year.empty:
+    for _, r in df_year.iterrows():
+        if r["net"] < target_savings:
+            alerts.append(f"Mes {REV_MONTHS_MAP[int(r['month'])]}: neto {r['net']:,.0f} por debajo del objetivo ({target_savings:,.0f}).")
+
+# Gasto por categoría vs MA3
+if not cats_year.empty:
+    for m in sorted(cats_year["month"].unique()):
+        grp_m = cats_year[cats_year["month"]==m]
+        for cat in grp_m["category"].unique():
+            series = cats_year[cats_year["category"]==cat].set_index("month").sort_index()["amount"]
             ma3 = series.rolling(3).mean().get(m, np.nan)
             val = series.get(m, np.nan)
             if pd.notna(val) and pd.notna(ma3) and ma3 > 0:
                 pct = (val/ma3 - 1)*100
                 if pct >= alert_threshold:
-                    alerts.append(f"Mes {REV_MONTHS_MAP[m]}: **{cat}** está {pct:.0f}% sobre su media móvil 3m ({val:,.0f} vs {ma3:,.0f}).")
+                    alerts.append(f"Mes {REV_MONTHS_MAP[m]}: **{cat}** {pct:.0f}% sobre su media móvil 3m ({val:,.0f} UYU vs {ma3:,.0f} UYU).")
 
-# 2) Neto vs objetivo de ahorro
-if target_savings and target_savings > 0 and not df_year.empty:
-    for _, r in df_year.iterrows():
-        diff = r["net"] - target_savings
-        if diff < 0:
-            alerts.append(f"Mes {REV_MONTHS_MAP[int(r['month'])]}: neto {r['net']:,.0f} por debajo del objetivo ({target_savings:,.0f}) en {abs(diff):,.0f}.")
-
-# 3) Gasto mes actual vs mismo mes año previo
+# Comparación con año previo
 if compare_prev_year and (year_sel-1 in years):
-    prev = net[net["year"]==year_sel-1]
+    prev = totals_df2[totals_df2["year"]==year_sel-1].sort_values("month")
     merged = df_year[["month","expense"]].merge(prev[["month","expense"]].rename(columns={"expense":"expense_prev"}), on="month", how="left")
     for _, r in merged.dropna().iterrows():
         if r["expense_prev"] > 0:
@@ -446,28 +529,9 @@ if alerts:
     for a in alerts[:8]:
         st.warning(a)
     if len(alerts) > 8:
-        st.info(f"…y {len(alerts)-8} alertas más. Ajustá el umbral en la barra lateral.")
+        st.info(f"…y {len(alerts)-8} alertas más (ajustá el umbral en la barra lateral).")
 else:
     st.success("Sin alertas con los parámetros actuales.")
 
-# -----------------------------
-# Descargas
-# -----------------------------
 st.markdown("---")
-st.subheader("⬇️ Descargas")
-# CSVs procesados
-st.download_button("Totales (income/expense) — tidy CSV", totals_df2.to_csv(index=False).encode("utf-8"), file_name="totales_tidy.csv", mime="text/csv")
-if not exp_by_cat2.empty:
-    st.download_button("Gastos por categoría — tidy CSV", exp_by_cat2.to_csv(index=False).encode("utf-8"), file_name="gastos_categoria_tidy.csv", mime="text/csv")
-if not inc_by_cat2.empty:
-    st.download_button("Ingresos por categoría — tidy CSV", inc_by_cat2.to_csv(index=False).encode("utf-8"), file_name="ingresos_categoria_tidy.csv", mime="text/csv")
-
-# Exportar editores del año seleccionado
-wide_pack = {
-    "income": st.session_state["edited_tables"][year_tab]["income"].to_csv(index=False),
-    "expense": st.session_state["edited_tables"][year_tab]["expense"].to_csv(index=False),
-}
-st.download_button(f"Editor {year_sel} — Ingresos (CSV)", wide_pack["income"].encode("utf-8"), file_name=f"ingresos_{year_sel}.csv", mime="text/csv")
-st.download_button(f"Editor {year_sel} — Gastos (CSV)", wide_pack["expense"].encode("utf-8"), file_name=f"gastos_{year_sel}.csv", mime="text/csv")
-
-st.caption("Los cambios del editor viven en sesión. Para persistirlos, descargá y luego unificalos en tu Excel, o mantené un CSV maestro. Si querés, puedo agregar exportación a Excel por año.")
+st.caption("Tip: Para persistir transacciones manuales, exportá CSV o conectá una Google Sheet. La conversión de moneda es USD↔︎UYU con el tipo de cambio ingresado.")
