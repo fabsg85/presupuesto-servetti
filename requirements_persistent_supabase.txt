@@ -1,0 +1,8 @@
+streamlit>=1.37
+pandas>=2.2.2
+numpy>=1.26
+openpyxl>=3.1.2
+plotly>=5.22.0
+statsmodels>=0.14.2
+supabase>=2.6.0
+postgrest>=0.14.9
