@@ -1,36 +1,38 @@
+# Finance CRM Dashboard (Streamlit + SQLite)
 
-# Presupuesto Familiar — Dashboard (Streamlit)
+Personal finance dashboard with persistent storage, CRM-style navigation and alerts.
 
-Un dashboard interactivo para el Excel **PRESUPUESTO FAMILIA SERVETTI**. Permite:
-- Ver KPIs YTD (ingresos, gastos, ahorro neto, tasa de ahorro).
-- Desglose por categorías de gasto (si existen en el Excel).
-- Gráficos de evolución (ingresos, gastos, neto) y balance acumulado.
-- Forecast de 6 meses del cash flow neto (Holt-Winters).
-- CRUD de transacciones manuales (agregar/editar/eliminar) con exportación/importación CSV.
+## Ejecutar
 
-## Estructura de datos
-El app parsea los totales e intenta leer el desglose de **GASTOS** por categoría por mes. Las transacciones manuales funcionan como **ajustes** arriba del Excel.
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-## Deploy gratis (dos opciones)
+Inicio de sesión demo: **demo@user.com / demo1234**.
 
-### Opción A — Streamlit Community Cloud (gratis)
-1. Subí estos archivos a un repo público en GitHub: `app.py`, `requirements.txt`.
-2. Ingresá a https://share.streamlit.io , conectá tu GitHub y elegí el repo.
-3. Configuración:
-   - Archivo principal: `app.py`
-   - Python: 3.11+
-4. Deploy. Abrí la URL que te da Streamlit.
+## Características
+- Autenticación simple por email + contraseña (datos por usuario).
+- Configuración por usuario: año, moneda, meta de ahorro.
+- Categorías de ingresos y gastos con presupuesto mensual opcional.
+- CRUD de transacciones con filtros y exportación CSV.
+- Dashboard con KPIs, alertas de presupuesto/ahorro, gráficos y resúmenes.
+- Forecast simple de 6 meses usando promedios móviles.
+- Datos seed listos (demo user, categorías y movimientos 2026) en SQLite `finance.db`.
 
-### Opción B — Hugging Face Spaces (gratis)
-1. Creá un Space nuevo tipo **Streamlit**.
-2. Subí `app.py` y `requirements.txt`.
-3. Deploy automático. Listo.
+## Publicar en GitHub
+Si quieres subir el proyecto a tu propio repositorio de GitHub, estos son los pasos básicos:
 
-> Persistencia: si querés persistir transacciones sin manejar CSV, podés conectar una Google Sheet usando `gspread` (requiere credenciales).
+```bash
+# 1) Crea un repositorio vacío en tu cuenta de GitHub
 
-## Uso
-1. Subí el Excel original desde la barra lateral.
-2. (Opcional) Cargá/edita transacciones manuales.
-3. Explorá KPIs, gráficos y forecast.
-4. Descargá CSVs para respaldo.
+# 2) Configura el remoto en este proyecto local
+git remote add origin git@github.com:TU_USUARIO/TU_REPO.git
 
+# 3) Sube la rama actual (por ejemplo, main o work)
+git push -u origin work
+
+# 4) Opcional: crea un pull request desde GitHub
+```
+
+Sustituye `TU_USUARIO/TU_REPO` por tu ruta real. Si prefieres usar HTTPS, reemplaza la URL del remoto por `https://github.com/TU_USUARIO/TU_REPO.git`.
