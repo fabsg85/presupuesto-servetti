@@ -198,7 +198,12 @@ with st.sidebar:
 # -----------------------------
 if "transactions" not in st.session_state:
     st.session_state["transactions"] = pd.DataFrame(columns=[
-        "date","type","category","amount","account","currency","tags","notes"
+        "date","type","category","amount","account","currency","tags","notes","member"
+    ])
+
+if "family_members" not in st.session_state:
+    st.session_state["family_members"] = pd.DataFrame([
+        {"member": "General", "role": "Admin", "email": "", "monthly_budget": 0.0},
     ])
 
 sheets, totals_df, exp_by_cat, inc_by_cat = (None, None, None, None)
@@ -283,6 +288,33 @@ exp_by_cat2 = pd.concat([exp_by_cat2, exp_tidy], ignore_index=True)
 # Transacciones manuales (multi-cuenta/moneda + tags)
 # -----------------------------
 st.subheader("🧾 Transacciones manuales (multi-cuenta / UYU-USD / tags)")
+
+def ensure_member_column(df, default_member="General"):
+    if "member" not in df.columns:
+        df["member"] = default_member
+    df["member"] = df["member"].fillna(default_member)
+    return df
+
+with st.expander("👥 Plan familiar (miembros y presupuesto mensual)", expanded=True):
+    st.caption("Definí quiénes forman parte del plan familiar y su presupuesto mensual esperado.")
+    members_df = st.session_state.get("family_members", pd.DataFrame())
+    members_df = members_df if not members_df.empty else pd.DataFrame(columns=["member","role","email","monthly_budget"])
+    members_edit = st.data_editor(
+        members_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "member": st.column_config.TextColumn("Nombre"),
+            "role": st.column_config.TextColumn("Rol"),
+            "email": st.column_config.TextColumn("Email"),
+            "monthly_budget": st.column_config.NumberColumn("Presupuesto mensual", format="%.0f", step=100.0),
+        },
+        key="members_editor",
+    )
+    st.session_state["family_members"] = members_edit
+
+member_options = [m for m in st.session_state["family_members"]["member"].dropna().unique().tolist() if m] or ["General"]
+st.session_state["transactions"] = ensure_member_column(st.session_state["transactions"], member_options[0])
 tx = st.session_state["transactions"]
 tx_edit = st.data_editor(
     tx,
@@ -297,6 +329,7 @@ tx_edit = st.data_editor(
         "currency": st.column_config.SelectboxColumn("Moneda", options=["UYU","USD"]),
         "tags": st.column_config.TextColumn("Tags (coma-separados)"),
         "notes": st.column_config.TextColumn("Notas"),
+        "member": st.column_config.SelectboxColumn("Integrante", options=member_options),
     },
     key="tx_editor"
 )
@@ -322,20 +355,26 @@ def convert_amount(row_amount, row_cur, to_cur, fx):
         return row_amount / fx
     return row_amount
 
+def filter_transactions(tx_df):
+    if tx_df is None or tx_df.empty:
+        return pd.DataFrame()
+    t = tx_df.dropna(subset=["date","amount"]).copy()
+    t["date"] = pd.to_datetime(t["date"], errors="coerce")
+    t = t.dropna(subset=["date"])
+    if account_filter:
+        t = t[t["account"].fillna("").str.contains(account_filter, case=False, na=False)]
+    if tag_filter:
+        t = t[t["tags"].fillna("").str.contains(tag_filter, case=False, na=False)]
+    t["year"] = t["date"].dt.year
+    t["month"] = t["date"].dt.month
+    return t
+
 # Tidy total a partir de categorias + transacciones
 def build_totals(inc_by_cat, exp_by_cat, tx_df):
     # Manual tx tidy (monthly)
     manual = pd.DataFrame()
-    if tx_df is not None and not tx_df.empty:
-        t = tx_df.dropna(subset=["date","amount"]).copy()
-        t["date"] = pd.to_datetime(t["date"], errors="coerce")
-        t = t.dropna(subset=["date"])
-        if account_filter:
-            t = t[t["account"].fillna("").str.contains(account_filter, case=False, na=False)]
-        if tag_filter:
-            t = t[t["tags"].fillna("").str.contains(tag_filter, case=False, na=False)]
-        t["year"] = t["date"].dt.year
-        t["month"] = t["date"].dt.month
+    t = filter_transactions(tx_df)
+    if not t.empty:
         sign = np.where(t["type"]=="Ingreso", 1, -1)
         # Convert amounts to base currency for aggregation
         t["amount_base"] = [convert_amount(a, c, base_currency, fx) for a,c in zip(t["amount"], t["currency"])]
@@ -372,6 +411,156 @@ def build_totals(inc_by_cat, exp_by_cat, tx_df):
     return merged
 
 totals_df2 = build_totals(inc_by_cat2, exp_by_cat2, st.session_state["transactions"])
+
+# -----------------------------
+# CRM familiar mensual (registro anual, tendencias y alertas)
+# -----------------------------
+st.markdown("---")
+st.subheader("🏡 CRM familiar: resumen mensual con alertas")
+
+month_choices = sorted(
+    list({(int(r.year), int(r.month)) for _, r in totals_df2.iterrows()}),
+    key=lambda x: (x[0], x[1])
+)
+choice_labels = [f"{y} — {REV_MONTHS_MAP.get(m, m)}" for y, m in month_choices]
+choice_idx = st.selectbox(
+    "Mes a monitorear",
+    options=list(range(len(month_choices))),
+    format_func=lambda i: choice_labels[i],
+    index=len(month_choices)-1 if month_choices else 0,
+)
+year_focus, month_focus = month_choices[choice_idx] if month_choices else (year_sel, int(df_year["month"].max()))
+
+def find_prev_month_pair(choices, current_pair):
+    if current_pair not in choices:
+        return None
+    idx = choices.index(current_pair)
+    return choices[idx-1] if idx-1 >= 0 else None
+
+prev_pair = find_prev_month_pair(month_choices, (year_focus, month_focus))
+
+month_focus_df = totals_df2[(totals_df2["year"]==year_focus) & (totals_df2["month"]==month_focus)]
+income_focus = float(month_focus_df["income"].sum()) if not month_focus_df.empty else 0.0
+expense_focus = float(month_focus_df["expense"].sum()) if not month_focus_df.empty else 0.0
+net_focus = income_focus - expense_focus
+
+prev_df = pd.DataFrame()
+if prev_pair:
+    prev_df = totals_df2[(totals_df2["year"]==prev_pair[0]) & (totals_df2["month"]==prev_pair[1])]
+prev_income = float(prev_df["income"].sum()) if not prev_df.empty else np.nan
+prev_expense = float(prev_df["expense"].sum()) if not prev_df.empty else np.nan
+
+c1, c2, c3 = st.columns(3)
+c1.metric(f"Ingresos {REV_MONTHS_MAP.get(month_focus, month_focus)} ({show_currency})", f"{income_focus:,.0f}",
+          delta=(income_focus - prev_income) if not math.isnan(prev_income) else None)
+c2.metric("Gastos", f"{expense_focus:,.0f}", delta=(expense_focus - prev_expense) if not math.isnan(prev_expense) else None)
+c3.metric("Ahorro neto", f"{net_focus:,.0f}", delta=(net_focus - (prev_income - prev_expense)) if not (math.isnan(prev_income) or math.isnan(prev_expense)) else None)
+
+# División de gastos por integrante
+def member_spend_breakdown(year, month, display_currency):
+    rows = []
+    # Gastos provenientes del Excel/editado (se asignan a "General")
+    base_exp = exp_by_cat2[(exp_by_cat2["year"]==year) & (exp_by_cat2["month"]==month)]
+    if not base_exp.empty:
+        amount = base_exp["amount"].sum()
+        if display_currency != "UYU":
+            amount = convert_amount(amount, "UYU", display_currency, fx)
+        rows.append({"member": "General", "amount": amount, "source": "Excel"})
+
+    # Transacciones manuales asignadas a integrante
+    t = filter_transactions(st.session_state["transactions"])
+    if not t.empty:
+        t_month = t[(t["year"]==year) & (t["month"]==month) & (t["type"]=="Gasto")]
+        if not t_month.empty:
+            t_month["amount_disp"] = [convert_amount(a, c, display_currency, fx) for a,c in zip(t_month["amount"], t_month["currency"])]
+            agg = t_month.groupby("member", as_index=False)["amount_disp"].sum()
+            for _, r in agg.iterrows():
+                rows.append({"member": r["member"], "amount": r["amount_disp"], "source": "Manual"})
+
+    df_rows = pd.DataFrame(rows)
+    if df_rows.empty:
+        return pd.DataFrame(columns=["member","amount","budget","estado"])
+
+    budgets = st.session_state.get("family_members", pd.DataFrame())
+    df_rows = df_rows.groupby("member", as_index=False)["amount"].sum()
+    df_rows["budget"] = df_rows["member"].map({row.member: row.monthly_budget for row in budgets.itertuples()})
+
+    def status(row):
+        budget = row.get("budget", 0) or 0
+        if budget <= 0:
+            return "⚪ Sin presupuesto"
+        pct = row["amount"] / budget
+        if pct >= 1.1:
+            return "🔴 Sobre presupuesto"
+        if pct >= 0.9:
+            return "🟡 Cerca del límite"
+        return "🟢 Saludable"
+
+    df_rows["estado"] = df_rows.apply(status, axis=1)
+    return df_rows.sort_values("amount", ascending=False)
+
+st.markdown("#### 👛 División de gastos por integrante")
+member_split = member_spend_breakdown(year_focus, month_focus, show_currency)
+if not member_split.empty:
+    st.dataframe(
+        member_split,
+        use_container_width=True,
+        column_config={
+            "member": "Integrante",
+            "amount": st.column_config.NumberColumn(f"Gasto ({show_currency})", format="%.0f"),
+            "budget": st.column_config.NumberColumn(f"Presupuesto ({show_currency})", format="%.0f"),
+            "estado": "Estado",
+        },
+        hide_index=True,
+    )
+    pie_members = px.pie(member_split, names="member", values="amount", title="Participación por integrante")
+    st.plotly_chart(pie_members, use_container_width=True)
+else:
+    st.info("Aún no hay gastos asignados a integrantes para este mes.")
+
+# Registro anual y tendencias rápidas
+st.markdown("#### 📘 Registro anual automatizado")
+annual_overview = totals_df2.groupby("year", as_index=False)[["income","expense","net"]].sum().sort_values("year")
+annual_overview["tasa_ahorro_%"] = (1 - (annual_overview["expense"] / annual_overview["income"])) * 100
+st.dataframe(
+    annual_overview,
+    use_container_width=True,
+    column_config={
+        "year": "Año",
+        "income": st.column_config.NumberColumn(f"Ingresos ({show_currency})", format="%.0f"),
+        "expense": st.column_config.NumberColumn(f"Gastos ({show_currency})", format="%.0f"),
+        "net": st.column_config.NumberColumn(f"Neto ({show_currency})", format="%.0f"),
+        "tasa_ahorro_%": st.column_config.NumberColumn("Tasa de ahorro (%)", format="%.1f"),
+    },
+    hide_index=True,
+)
+
+trend_fig = px.bar(annual_overview, x="year", y=["income","expense","net"], barmode="group", title="Ingresos vs gastos (anual)")
+st.plotly_chart(trend_fig, use_container_width=True)
+
+# Tendencias y alertas
+st.markdown("#### 🚦 Alertas y notificaciones")
+alerts = []
+if net_focus < 0:
+    alerts.append(f"Neto negativo ({net_focus:,.0f} {show_currency}).")
+if target_savings and net_focus < target_savings:
+    alerts.append(f"Ahorro neto por debajo del objetivo ({net_focus:,.0f} vs {target_savings:,.0f} {show_currency}).")
+if prev_expense and not math.isnan(prev_expense):
+    change = (expense_focus / prev_expense - 1) * 100 if prev_expense else np.nan
+    if pd.notna(change) and change >= alert_threshold:
+        alerts.append(f"Gasto mensual {change:.0f}% sobre el mes anterior.")
+
+for _, row in member_split.iterrows():
+    budget = row.get("budget", 0) or 0
+    if budget > 0 and row["amount"] > budget:
+        alerts.append(f"{row['member']} superó su presupuesto ({row['amount']:,.0f} / {budget:,.0f} {show_currency}).")
+
+if alerts:
+    for msg in alerts:
+        st.warning(msg)
+        st.toast(msg)
+else:
+    st.success("Sin alertas en el mes monitoreado.")
 
 # -----------------------------
 # KPIs y análisis (incluye dependencia de ingresos)
