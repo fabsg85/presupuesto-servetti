@@ -189,6 +189,96 @@ def seed_data():
 init_db()
 seed_data()
 
+
+def seed_default_categories_for_user(user_id: int):
+    base_categories = [
+        ("INGRESO", "Sueldo principal", None, 1, None),
+        ("INGRESO", "Otros ingresos", None, 0, None),
+        ("GASTO", "Alquiler", "FIJO", 1, 25000),
+        ("GASTO", "Servicios", "FIJO", 1, 6000),
+        ("GASTO", "Supermercado", "VARIABLE", 1, 15000),
+        ("GASTO", "Transporte", "VARIABLE", 1, 6000),
+        ("GASTO", "Salud", "VARIABLE", 1, 4000),
+        ("GASTO", "Ocio", "VARIABLE", 0, 8000),
+        ("GASTO", "Mascotas", "VARIABLE", 0, 4000),
+        ("GASTO", "Otros", "VARIABLE", 0, 3000),
+    ]
+    conn = get_conn()
+    cur = conn.cursor()
+    for cat in base_categories:
+        cur.execute(
+            "INSERT OR IGNORE INTO Category (userId, type, name, fixedVariable, essential, monthlyBudget) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, *cat),
+        )
+    conn.commit()
+    conn.close()
+
+
+def create_user(name: str, email: str, password: str, currency: str = "UYU", year: Optional[int] = None, savings_target: float = 0.2):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        now = datetime.utcnow().isoformat()
+        cur.execute(
+            "INSERT INTO User (name, email, passwordHash, createdAt) VALUES (?, ?, ?, ?)",
+            (name, email, hash_password(password), now),
+        )
+        user_id = cur.lastrowid
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return None, "El email ya está registrado"
+    conn.close()
+
+    upsert_config(user_id, int(year or datetime.utcnow().year), currency, float(savings_target))
+    seed_default_categories_for_user(user_id)
+    return user_id, None
+
+
+def list_users() -> List[Tuple[int, str, str, str]]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, email, createdAt FROM User ORDER BY createdAt DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_user_by_id(user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, email FROM User WHERE id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def update_user(user_id: int, name: str, email: str, password: Optional[str] = None):
+    conn = get_conn()
+    cur = conn.cursor()
+    fields = ["name = ?", "email = ?"]
+    params: List = [name, email]
+    if password:
+        fields.append("passwordHash = ?")
+        params.append(hash_password(password))
+    params.append(user_id)
+    cur.execute(f"UPDATE User SET {', '.join(fields)} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def delete_user(user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM Transaction WHERE userId=?", (user_id,))
+    cur.execute("DELETE FROM Category WHERE userId=?", (user_id,))
+    cur.execute("DELETE FROM Config WHERE userId=?", (user_id,))
+    cur.execute("DELETE FROM User WHERE id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -377,18 +467,45 @@ def export_transactions_csv(user_id: int) -> pd.DataFrame:
 
 
 def login_form():
-    st.header("Iniciar sesión")
-    with st.form("login_form"):
-        email = st.text_input("Email", value="demo@user.com")
-        password = st.text_input("Contraseña", type="password", value="demo1234")
-        submitted = st.form_submit_button("Ingresar")
-    if submitted:
-        user = get_user_by_email(email)
-        if user and user[3] == hash_password(password):
-            st.session_state.user = {"id": user[0], "name": user[1], "email": user[2]}
-            st.success("Bienvenido de nuevo")
-        else:
-            st.error("Credenciales inválidas")
+    st.header("Bienvenido 👋")
+    st.write("Inicia sesión o crea tu cuenta en 1 minuto para empezar a presupuestar.")
+    tab_login, tab_signup = st.tabs(["Iniciar sesión", "Crear cuenta"])
+
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", value="demo@user.com")
+            password = st.text_input("Contraseña", type="password", value="demo1234")
+            submitted = st.form_submit_button("Ingresar")
+        if submitted:
+            user = get_user_by_email(email)
+            if user and user[3] == hash_password(password):
+                st.session_state.user = {"id": user[0], "name": user[1], "email": user[2]}
+                st.success("Bienvenido de nuevo")
+                st.experimental_rerun()
+            else:
+                st.error("Credenciales inválidas")
+
+    with tab_signup:
+        st.info("Onboarding guiado para tu primer usuario. Puedes ajustar todo luego.")
+        with st.form("signup_form"):
+            name = st.text_input("Nombre completo", value="Nuevo usuario")
+            email_new = st.text_input("Email")
+            password_new = st.text_input("Contraseña", type="password")
+            currency = st.text_input("Moneda", value="UYU")
+            year = st.number_input("Año de trabajo", value=datetime.utcnow().year, step=1)
+            savings_target = st.slider("Meta de ahorro %", 0.0, 1.0, value=0.2)
+            submitted_signup = st.form_submit_button("Crear cuenta")
+        if submitted_signup:
+            if not email_new or not password_new:
+                st.error("Email y contraseña son obligatorios")
+            else:
+                new_user_id, error = create_user(name, email_new, password_new, currency, int(year), float(savings_target))
+                if error:
+                    st.error(error)
+                else:
+                    st.success("Cuenta creada. Ya puedes iniciar sesión.")
+                    st.session_state.user = {"id": new_user_id, "name": name, "email": email_new}
+                    st.experimental_rerun()
 
 
 # ----------------------------
@@ -457,6 +574,82 @@ def savings_percentage(income: float, expense: float) -> float:
     if income == 0:
         return 0
     return (income - expense) / income
+
+
+def suggest_transaction(user_id: int, description: str, amount: float):
+    """
+    Simple heuristic to propose category, payment method and notes based on texto y histórico.
+    """
+    desc_lower = description.lower()
+    categories = list_categories(user_id)
+    keyword_map = {
+        "alquiler": "Alquiler",
+        "renta": "Alquiler",
+        "super": "Supermercado",
+        "mercado": "Supermercado",
+        "comida": "Supermercado",
+        "uber": "Transporte",
+        "taxi": "Transporte",
+        "nafta": "Transporte",
+        "gasolina": "Transporte",
+        "internet": "Servicios",
+        "luz": "Servicios",
+        "electricidad": "Servicios",
+        "agua": "Servicios",
+        "medico": "Salud",
+        "salud": "Salud",
+        "cable": "Servicios",
+        "cine": "Ocio",
+        "restaurante": "Ocio",
+        "bar": "Ocio",
+        "perro": "Mascotas",
+        "gato": "Mascotas",
+        "mascota": "Mascotas",
+        "sueldo": "Sueldo principal",
+        "salario": "Sueldo principal",
+    }
+
+    cat_id = None
+    cat_type = "GASTO"
+    for kw, cat_name in keyword_map.items():
+        if kw in desc_lower:
+            match = next((c for c in categories if c[2].lower() == cat_name.lower()), None)
+            if match:
+                cat_id = match[0]
+                cat_type = match[1]
+                break
+
+    df = load_transactions_df(user_id)
+    suggested_payment = "Débito"
+    if not df.empty:
+        if cat_id:
+            cat_name = next((c[2] for c in categories if c[0] == cat_id), None)
+            if cat_name:
+                pmode_series = df[(df["category"] == cat_name)]["paymentMethod"].value_counts()
+                if not pmode_series.empty:
+                    suggested_payment = pmode_series.idxmax()
+        else:
+            pmode_series = df["paymentMethod"].value_counts()
+            if not pmode_series.empty:
+                suggested_payment = pmode_series.idxmax()
+
+        if not cat_id and description:
+            mask = df["notes"].fillna("").str.lower().str.contains(desc_lower)
+            if mask.any():
+                cat_counts = df[mask]["category"].value_counts()
+                if not cat_counts.empty:
+                    cat_from_note = cat_counts.idxmax()
+                    cat = next((c for c in categories if c[2] == cat_from_note), None)
+                    if cat:
+                        cat_id = cat[0]
+                        cat_type = cat[1]
+
+    return {
+        "category_id": cat_id if cat_id else (categories[0][0] if categories else None),
+        "type": cat_type,
+        "paymentMethod": suggested_payment,
+        "notes": description.capitalize() if description else "",
+    }
 
 
 # ----------------------------
@@ -744,6 +937,116 @@ def forecast_page(user):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def smart_entry_page(user):
+    st.header("Carga inteligente de gastos")
+    st.write("Automatiza la carga: escribe un monto y descripción y te sugerimos categoría, método de pago y notas.")
+
+    df = load_transactions_df(user["id"])
+    col_info, col_form = st.columns([1, 2])
+    with col_info:
+        st.markdown(
+            """
+            **Cómo funciona**
+            - Detecta palabras clave (ej: _super_, _internet_, _uber_) para proponer categorías.
+            - Aprende de tu historial: busca coincidencias en notas para reutilizar categorías y métodos de pago.
+            - Puedes editar lo sugerido antes de guardar.
+            """
+        )
+        if df.empty:
+            st.info("Sin historial aún. Se usarán solo las palabras clave predefinidas.")
+        else:
+            recent = df.sort_values("date", ascending=False).head(5)[["date", "category", "amount", "paymentMethod"]]
+            st.markdown("Últimos movimientos")
+            st.dataframe(recent, use_container_width=True, hide_index=True)
+
+    with col_form:
+        amount = st.number_input("Monto", min_value=0.0, step=100.0)
+        description = st.text_input("Descripción / para qué es")
+        if st.button("Sugerir llenado", type="primary"):
+            suggestion = suggest_transaction(user["id"], description, amount)
+            st.session_state.suggested_tx = suggestion
+            st.success("Listo. Revisa y confirma debajo.")
+
+        suggestion = st.session_state.get("suggested_tx", None)
+        categories_income = list_categories(user["id"], "INGRESO")
+        categories_expense = list_categories(user["id"], "GASTO")
+
+        with st.form("smart_form"):
+            tx_type = st.selectbox("Tipo", options=["GASTO", "INGRESO"], index=0 if not suggestion or suggestion["type"] == "GASTO" else 1)
+            tx_categories = categories_expense if tx_type == "GASTO" else categories_income
+            cat_options = {c[0]: c[2] for c in tx_categories} if tx_categories else {None: "Agrega una categoría en Config"}
+            default_cat = suggestion["category_id"] if suggestion and suggestion["category_id"] in cat_options else (tx_categories[0][0] if tx_categories else None)
+            category_id = st.selectbox(
+                "Categoría",
+                options=list(cat_options.keys()),
+                format_func=lambda x: cat_options.get(x, ""),
+                index=list(cat_options.keys()).index(default_cat) if default_cat in cat_options else 0,
+            )
+            payment_method = st.text_input("Método de pago", value=suggestion["paymentMethod"] if suggestion else "Santander")
+            notes = st.text_area("Notas", value=suggestion["notes"] if suggestion else description)
+            submitted = st.form_submit_button("Guardar transacción")
+        if submitted:
+            if category_id is None:
+                st.error("Necesitas una categoría para guardar.")
+            else:
+                create_or_update_transaction(user["id"], None, date.today(), tx_type, category_id, amount, payment_method, notes)
+                st.success("Transacción creada con los datos sugeridos.")
+                st.session_state.pop("suggested_tx", None)
+                st.experimental_rerun()
+
+
+def users_admin_page(user):
+    st.header("Usuarios (ABM & Onboarding)")
+    st.warning("Función administrativa. Cualquier cambio afecta a todos los datos.")
+    users = list_users()
+    if users:
+        users_df = pd.DataFrame(users, columns=["id", "Nombre", "Email", "Creado"])
+        st.dataframe(users_df, use_container_width=True)
+
+    col_new, col_edit = st.columns(2)
+    with col_new:
+        st.subheader("Alta rápida")
+        with st.form("admin_create_user"):
+            name = st.text_input("Nombre completo", value="Usuario nuevo")
+            email = st.text_input("Email nuevo")
+            password = st.text_input("Contraseña nueva", type="password")
+            currency = st.text_input("Moneda", value="UYU")
+            year = st.number_input("Año", value=datetime.utcnow().year, step=1)
+            savings_target = st.slider("Meta de ahorro %", 0.0, 1.0, value=0.2, key="admin_savings")
+            create_submitted = st.form_submit_button("Crear usuario")
+        if create_submitted:
+            new_id, error = create_user(name, email, password, currency, int(year), float(savings_target))
+            if error:
+                st.error(error)
+            else:
+                st.success(f"Usuario creado (id {new_id}). Categorías base cargadas.")
+                st.experimental_rerun()
+
+    with col_edit:
+        st.subheader("Editar / eliminar")
+        if not users:
+            st.info("No hay usuarios para editar.")
+        else:
+            selected_id = st.selectbox("Seleccionar usuario", options=[u[0] for u in users], format_func=lambda uid: next(u[2] for u in users if u[0] == uid))
+            user_data = get_user_by_id(selected_id)
+            default_name = user_data[1] if user_data else ""
+            default_email = user_data[2] if user_data else ""
+            with st.form("admin_edit_user"):
+                new_name = st.text_input("Nombre", value=default_name)
+                new_email = st.text_input("Email", value=default_email)
+                new_password = st.text_input("Nueva contraseña (opcional)", type="password")
+                submitted_edit = st.form_submit_button("Guardar cambios")
+            if submitted_edit:
+                update_user(selected_id, new_name, new_email, new_password if new_password else None)
+                st.success("Datos actualizados")
+                st.experimental_rerun()
+
+            if st.button("Eliminar usuario y todos sus datos", type="primary"):
+                delete_user(selected_id)
+                st.success("Usuario eliminado")
+                st.experimental_rerun()
+
+
 # ----------------------------
 # App
 # ----------------------------
@@ -759,7 +1062,7 @@ if st.session_state.user is None:
 user = st.session_state.user
 st.sidebar.title("💼 Finance CRM")
 st.sidebar.write(user["name"])
-page = st.sidebar.radio("Navegación", ["Dashboard", "Movimientos", "Categorías & Config", "Forecast"])
+page = st.sidebar.radio("Navegación", ["Dashboard", "Movimientos", "Categorías & Config", "Forecast", "Carga inteligente", "Usuarios"])
 if st.sidebar.button("Cerrar sesión"):
     st.session_state.user = None
     st.experimental_rerun()
@@ -772,3 +1075,7 @@ elif page == "Categorías & Config":
     categories_page(user)
 elif page == "Forecast":
     forecast_page(user)
+elif page == "Carga inteligente":
+    smart_entry_page(user)
+elif page == "Usuarios":
+    users_admin_page(user)
